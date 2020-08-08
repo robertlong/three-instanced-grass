@@ -1,0 +1,287 @@
+<html>
+  <head>
+    <title>Grass Shader</title>
+    <style>
+      html, body {
+        margin: 0;
+      }
+
+      canvas {
+        width: 100vw;
+        height: 100vh;
+        display: block;
+        background-color: black;
+      }
+    </style>
+  </head>
+  <body>
+    <canvas id="canvas"></canvas>
+
+    <script type="module">
+      import { Scene, Vector2, Quaternion, Vector3, Color, Matrix4, MathUtils, PlaneBufferGeometry, MeshBasicMaterial, InstancedBufferGeometry, InstancedBufferAttribute,  AmbientLight, TextureLoader, ACESFilmicToneMapping, sRGBEncoding, DirectionalLight, PerspectiveCamera, WebGLRenderer, BoxGeometry, ShaderMaterial, Mesh } from "//unpkg.com/three@0.116.1/build/three.module.js";
+      import { EffectComposer } from "//unpkg.com/three@0.116.1/examples/jsm/postprocessing/EffectComposer.js";
+			import { RenderPass } from "//unpkg.com/three@0.116.1/examples/jsm/postprocessing/RenderPass.js";
+			import { ShaderPass } from "//unpkg.com/three@0.116.1/examples/jsm/postprocessing/ShaderPass.js";
+      import { SAOPass } from "//unpkg.com/three@0.116.1/examples/jsm/postprocessing/SAOPass.js";
+      import { BokehPass } from "//unpkg.com/three@0.116.1/examples/jsm/postprocessing/BokehPass.js";
+      import { FXAAShader } from "//unpkg.com/three@0.116.1/examples/jsm/shaders/FXAAShader.js";
+      import { GLTFLoader } from "//unpkg.com/three@0.116.1/examples/jsm/loaders/GLTFLoader.js";
+      import { OrbitControls } from "//unpkg.com/three@0.116.1/examples/jsm/controls/OrbitControls.js";
+
+      const canvas = document.getElementById("canvas");
+
+      const scene = new Scene();
+      const camera = new PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+
+      const renderer = new WebGLRenderer({ canvas });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setPixelRatio(window.devicePixelRatio);
+      renderer.toneMapping = ACESFilmicToneMapping;
+      renderer.toneMappingExposure = 0.8;
+      renderer.outputEncoding = sRGBEncoding;
+
+      const renderPass = new RenderPass(scene, camera);
+      const fxaaPass = new ShaderPass(FXAAShader);
+      
+      const pixelRatio = renderer.getPixelRatio();
+
+      fxaaPass.material.uniforms['resolution'].value.x = 1 / (window.innerWidth * pixelRatio);
+      fxaaPass.material.uniforms['resolution'].value.y = 1 / (window.innerHeight * pixelRatio);
+
+      const saoPass = new SAOPass(scene, camera, true, false);
+      saoPass.params.saoBias = 0.01;
+      saoPass.params.saoIntensity = 0.18;
+      saoPass.params.saoScale = 100;
+      saoPass.params.saoKernelRadius = 4;
+      saoPass.params.saoMinResolution = 0;
+      saoPass.params.saoBlur = true;
+      saoPass.params.saoBlurRadius = 51.6;
+      saoPass.params.saoBlurStdDev = 10;
+      saoPass.params.saoBlurDepthCutoff = 0.014;
+
+      const bokehPass = new BokehPass(scene, camera,{
+        focus: 1.0,
+        aperture:	0.00025,
+        maxblur:	0.01,
+        width: window.innerWidth,
+        height: window.innerHeight
+			});
+
+      const effectComposer = new EffectComposer(renderer);
+      effectComposer.addPass(renderPass);
+			//effectComposer.addPass(saoPass);
+      effectComposer.addPass(bokehPass);
+      //effectComposer.addPass(fxaaPass);
+
+      const controls = new OrbitControls( camera, renderer.domElement );
+      controls.minDistance = 2;
+      controls.maxDistance = 10;
+      controls.target.set( 0, 0, - 0.2 );
+
+      class GrassMaterial extends ShaderMaterial {
+        static vertexShader = `
+        uniform vec2 windDirection;
+        uniform float windSpeed;
+        uniform float windStrength;
+        uniform float noiseScale;
+        uniform sampler2D noise;
+        uniform float time;
+        uniform mat4 inverseMatrixWorld;
+
+        attribute vec3 translate;
+        attribute vec4 rotate;
+        attribute float timeOffset;
+
+        varying vec2 vUv;
+        varying float vHeight;
+        varying float vColor;
+
+        //https://www.geeks3d.com/20141201/how-to-rotate-a-vertex-by-a-quaternion-in-glsl/
+        vec3 rotateVectorByQuaternion(vec3 v, vec4 q){
+          return 2.0 * cross(q.xyz, v * q.w + cross(q.xyz, v)) + v;
+        }
+
+        void main() {
+          vHeight = position.y;
+          vUv = uv;
+
+          float adjustedTime = time + timeOffset;
+
+          vec3 pos = position + translate;
+          pos = rotateVectorByQuaternion(pos, rotate);
+          vec4 worldPosition = modelMatrix * vec4(pos, 1.0);
+
+          float influence = smoothstep(0.0, 1.0, vHeight / 2.0);
+          vec2 uv = worldPosition.xz / (noiseScale + 1e-2);
+          vec2 panningUv = uv + fract(adjustedTime * windDirection * windSpeed);
+          float wind = texture2D(noise, panningUv).r * 2.0 - 0.4;
+          vColor = texture2D(noise, uv).r;
+          
+          vec2 windOffset = -windDirection * windStrength * influence * wind;
+          worldPosition.xz += windOffset;
+          worldPosition.y -= wind * influence * smoothstep(0.0, vHeight, windStrength);
+          vec4 localPosition = inverseMatrixWorld * worldPosition;
+          localPosition.x += influence * cos(adjustedTime * 1.0) / 8.0;
+          localPosition.z += influence * sin(adjustedTime * 1.5) / 8.0;
+
+          gl_Position = projectionMatrix * modelViewMatrix * localPosition;
+        }
+        `;
+
+        static fragmentShader = `
+        uniform sampler2D map;
+        uniform sampler2D gradient;
+        uniform float grassHeight;
+        uniform vec3 secondaryColor;
+        uniform float secondaryAttenuation;
+
+        varying vec2 vUv;
+        varying float vHeight;
+        varying float vColor;
+
+        void main() {
+          vec4 color = texture2D(map, vUv);
+
+          if (color.a < 0.5) {
+            discard;
+          }
+
+          vec4 gradient = texture2D(gradient, vec2(0.0, vHeight / grassHeight));
+
+          gl_FragColor = vec4(color.rgb * gradient.rgb, 1.0);
+
+          float secondaryWeight = smoothstep(0.0, 1.0, secondaryAttenuation - vColor );
+          vec3 albedo = color.rbg * gradient.rgb;
+          albedo = mix(albedo, secondaryColor.rgb, secondaryWeight);
+
+          gl_FragColor = vec4(albedo, 1.0);
+        }
+        `;
+
+        static onBeforeRender() {
+          this.material.uniforms.inverseMatrixWorld.value.getInverse(this.matrixWorld);
+        }
+
+        constructor({ map, gradient, noise }) {
+          const inverseMatrixWorld = new Matrix4();
+
+          super({
+            uniforms: {
+              time: { value: 0 },
+              windDirection: { value: new Vector2(1, -0.5) },
+              windSpeed: { value: 1 },
+              windStrength: { value: 2 },
+              noiseScale: { value: 20 },
+              grassHeight: { value: 0.5 },
+              noise: { value: noise },
+              map: { value: map },
+              gradient: { value: gradient },
+              secondaryColor: { value: new Color().setRGB(1, 0.2, 0.2) },
+              secondaryAttenuation: { value: 0.2 },
+              inverseMatrixWorld: { value: new Matrix4() }
+            },
+            vertexShader: GrassMaterial.vertexShader,
+            fragmentShader: GrassMaterial.fragmentShader
+          });
+        }
+
+        update(time) {
+          this.uniforms.time.value = time / 1000;
+        }
+      }
+
+      const noiseTexture = new TextureLoader().load("./noise.png", tex => {
+        tex.flipY = false;
+      });
+
+      const grassTexture = new TextureLoader().load("./grass_1.png", tex => {
+        tex.flipY = false;
+      });
+
+      const gradientTexture = new TextureLoader().load("./gradient.png", tex => {
+        tex.flipY = true;
+      });
+
+      const grassMaterial = new GrassMaterial({ map: grassTexture, gradient: gradientTexture });
+
+      new GLTFLoader().load("./grass.gltf", ({ scene: grass }) => {
+        grass.traverse(child => {
+          if (child.isMesh) {
+            const geometry = new InstancedBufferGeometry();
+            geometry.index = child.geometry.index;
+            geometry.attributes = child.geometry.attributes;
+
+            const instanceCount = 50000;
+            
+            const translateArray = new Float32Array(instanceCount * 3);
+            const rotateArray = new Float32Array(instanceCount * 4);
+            const timeOffsetArray = new Float32Array(instanceCount);
+            const tempQuat = new Quaternion();
+            const rotAxis = new Vector3(0, 1, 0);
+            const width = 100;
+            const depth = 100;
+
+            for (let i = 0; i < instanceCount; i++) {
+              translateArray[ i * 3 ] = Math.random() * width - width / 2;
+              translateArray[ i * 3 + 2 ] = Math.random() * depth - depth / 2;
+
+              const angle = Math.PI - Math.random() * (2 * Math.PI);
+              tempQuat.setFromAxisAngle(rotAxis, angle);
+              rotateArray[ i * 4] = tempQuat.x;
+              rotateArray[ i * 4 + 1] = tempQuat.y;
+              rotateArray[ i * 4 + 2] = tempQuat.z;
+              rotateArray[ i * 4 + 3] = tempQuat.w;
+              timeOffsetArray[i] = Math.random() * 1000;
+            }
+
+            geometry.setAttribute('translate', new InstancedBufferAttribute(translateArray, 3));
+            geometry.setAttribute('rotate', new InstancedBufferAttribute(rotateArray, 4));
+            geometry.setAttribute('timeOffset', new InstancedBufferAttribute(timeOffsetArray, 1));
+      
+            child.geometry = geometry;
+            child.material = grassMaterial;
+            child.onBeforeRender = GrassMaterial.onBeforeRender;
+          }
+        });
+
+        scene.add(grass);
+      });
+
+      const plane = new Mesh(new PlaneBufferGeometry(), new MeshBasicMaterial());
+      plane.rotation.x = MathUtils.degToRad(-90);
+      plane.scale.setScalar(100);
+
+      scene.add(plane);
+
+      scene.add(new AmbientLight());
+
+      scene.add(new DirectionalLight());
+
+      camera.position.z = 5;
+
+      function onWindowResize() {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        effectComposer.setSize(window.innerWidth, window.innerHeight);
+
+        const pixelRatio = renderer.getPixelRatio();
+
+        fxaaPass.material.uniforms['resolution'].value.x = 1 / (window.innerWidth * pixelRatio);
+        fxaaPass.material.uniforms['resolution'].value.y = 1 / (window.innerHeight * pixelRatio);
+      }
+
+      window.addEventListener('resize', onWindowResize);
+
+      function animate(time) {
+        requestAnimationFrame(animate);
+        controls.update();
+        grassMaterial.update(time);
+        effectComposer.render();
+      }
+
+      animate();
+    </script>
+  </body>
+</html>
